@@ -211,7 +211,7 @@ impl<N: Network> CoinbasePuzzle<N> {
                     proof_target >= minimum_target,
                     "Prover solution was below the necessary proof target ({proof_target} < {minimum_target})"
                 );*/
-                eprintln!("-----target: {} {}", proof_target, minimum_target);
+                //eprintln!("-----target: {} {}", proof_target, minimum_target);
                 if proof_target < minimum_target {
                     continue;
                 }

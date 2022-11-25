@@ -524,7 +524,7 @@ pub(super) fn batch_msm_cuda<G: AffineCurve>(
         }
     }
 
-    eprintln!("results len: {}", results.len());
+    //eprintln!("results len: {}", results.len());
     Ok(results)
 }
 
