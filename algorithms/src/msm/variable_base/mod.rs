@@ -27,6 +27,7 @@ use snarkvm_curves::{bls12_377::G1Affine, traits::AffineCurve};
 use snarkvm_fields::PrimeField;
 
 use core::any::TypeId;
+use snarkvm_fields::Zero;
 
 #[cfg(all(feature = "cuda", target_arch = "x86_64"))]
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +56,33 @@ impl VariableBase {
         // For all other curves, we perform variable base MSM using Pippenger's algorithm.
         else {
             standard::msm(bases, scalars)
+        }
+    }
+
+    pub fn batch_msm<G: AffineCurve>(
+        bases: &[G],
+        scalars: Vec<Vec<<G::ScalarField as PrimeField>::BigInteger>>,
+    ) -> Vec<G::Projective> {
+        // For BLS12-377, we perform variable base MSM using a batched addition technique.
+        if TypeId::of::<G>() == TypeId::of::<G1Affine>() {
+            #[cfg(all(feature = "cuda", target_arch = "x86_64"))]
+            if !HAS_CUDA_FAILED.load(Ordering::SeqCst) {
+                // consturct bases
+                match cuda::batch_msm_cuda(bases, scalars) {
+                    Ok(x) => return x,
+                    Err(_e) => {
+                        HAS_CUDA_FAILED.store(true, Ordering::SeqCst);
+                        eprintln!("CUDA failed, moving to the next MSM method");
+                    }
+                }
+            }
+            //batched::msm(bases, scalars[0])
+            [G::Projective::zero(), G::Projective::zero()].to_vec()
+        }
+        // For all other curves, we perform variable base MSM using Pippenger's algorithm.
+        else {
+            //standard::msm(bases, scalars[0])
+            [G::Projective::zero(), G::Projective::zero()].to_vec()
         }
     }
 

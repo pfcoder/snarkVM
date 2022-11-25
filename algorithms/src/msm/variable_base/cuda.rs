@@ -158,7 +158,7 @@ fn generate_cuda_binary<P: AsRef<Path>>(file_path: P, debug: bool) -> Result<(),
 }
 
 /// Loads the msm.fatbin into an executable CUDA program.
-fn load_cuda_program() -> Result<Program, GPUError> {
+/*fn load_cuda_program() -> Result<Program, GPUError> {
     let devices: Vec<_> = Device::all();
     let device = match devices.first() {
         Some(device) => device,
@@ -194,6 +194,54 @@ fn load_cuda_program() -> Result<Program, GPUError> {
     };
 
     Ok(Program::Cuda(cuda_program))
+}*/
+
+/// Loads the msm.fatbin into an executable CUDA program.
+fn load_cuda_program() -> Result<Vec<Program>, GPUError> {
+    let devices: Vec<_> = Device::all();
+
+    // Find the path to the msm fatbin kernel
+    let mut file_path = aleo_std::aleo_dir();
+    file_path.push("resources/cuda/msm.fatbin");
+
+    // If the file does not exist, regenerate the fatbin.
+    if !file_path.exists() {
+        generate_cuda_binary(&file_path, false)?;
+    }
+
+    // go through all devices and load the fatbin
+    let mut programs = Vec::new();
+    for device in devices {
+        /*let device = match devices.first() {
+            Some(device) => device,
+            None => return Err(GPUError::DeviceNotFound),
+        };*/
+
+        let cuda_device = match device.cuda_device() {
+            Some(device) => device,
+            None => return Err(GPUError::DeviceNotFound),
+        };
+
+        eprintln!("\nUsing '{}' as CUDA device with {} bytes of memory", device.name(), device.memory());
+
+        let cuda_kernel = std::fs::read(file_path.clone())?;
+
+        // Load the cuda program from the kernel bytes.
+        let cuda_program = match cuda::Program::from_bytes(cuda_device, &cuda_kernel) {
+            Ok(program) => program,
+            Err(err) => {
+                // Delete the failing cuda kernel.
+                std::fs::remove_file(file_path)?;
+                return Err(err);
+            }
+        };
+
+        programs.push(Program::Cuda(cuda_program));
+    }
+
+    Ok(programs)
+
+    //Ok(Program::Cuda(cuda_program))
 }
 
 /// Run the CUDA MSM operation for a given request.
@@ -278,7 +326,7 @@ fn handle_cuda_request(context: &mut CudaContext, request: &CudaRequest) -> Resu
 }
 
 /// Initialize the cuda request handler.
-fn initialize_cuda_request_handler(input: crossbeam_channel::Receiver<CudaRequest>) {
+/*fn initialize_cuda_request_handler(input: crossbeam_channel::Receiver<CudaRequest>) {
     match load_cuda_program() {
         Ok(program) => {
             let num_groups = (SCALAR_BITS + BIT_WIDTH - 1) / BIT_WIDTH;
@@ -295,6 +343,51 @@ fn initialize_cuda_request_handler(input: crossbeam_channel::Receiver<CudaReques
                 let out = handle_cuda_request(&mut context, &request);
 
                 request.response.send(out).ok();
+            }
+        }
+        Err(err) => {
+            eprintln!("Error loading cuda program: {:?}", err);
+            // If the cuda program fails to load, notify the cuda request dispatcher.
+            while let Ok(request) = input.recv() {
+                request.response.send(Err(GPUError::DeviceNotFound)).ok();
+            }
+        }
+    }
+}*/
+
+fn initialize_cuda_request_handler(input: crossbeam_channel::Receiver<CudaRequest>) {
+    match load_cuda_program() {
+        Ok(programs) => {
+            // chris change to program Vec<Program>
+            let num_groups = (SCALAR_BITS + BIT_WIDTH - 1) / BIT_WIDTH;
+
+            let mut contexts: Vec<CudaContext> = Vec::new();
+            for program in programs {
+                let context = CudaContext {
+                    num_groups: num_groups as u32,
+                    pixel_func_name: "msm6_pixel".to_string(),
+                    row_func_name: "msm6_collapse_rows".to_string(),
+                    program,
+                };
+                contexts.push(context);
+            }
+
+            let mut context_index = 0;
+            let max_context_count = contexts.len();
+
+            // chris: fill all cards context
+
+            // Handle each cuda request received from the channel.
+            while let Ok(request) = input.recv() {
+                if context_index >= max_context_count {
+                    context_index = 0;
+                }
+                //eprintln!("using cuda: {}", context_index);
+                let mut context = &mut contexts[context_index];
+                let out = handle_cuda_request(&mut context, &request);
+                request.response.send(out).ok();
+
+                context_index += 1;
             }
         }
         Err(err) => {
@@ -350,6 +443,89 @@ pub(super) fn msm_cuda<G: AffineCurve>(
         Ok(x) => unsafe { std::mem::transmute_copy(&x) },
         Err(_) => Err(GPUError::DeviceNotFound),
     }
+}
+
+lazy_static::lazy_static! {
+    static ref CUDA_DISPATCHS: Vec<crossbeam_channel::Sender<CudaRequest>> = {
+        let mut senders = Vec::new();
+        for _i in 0..8 {
+            let (sender, receiver) = crossbeam_channel::bounded(4096);
+            std::thread::spawn(move || initialize_cuda_request_handler(receiver));
+            senders.push(sender);
+        }
+        senders
+    };
+}
+
+#[allow(clippy::transmute_undefined_repr)]
+pub(super) fn batch_msm_cuda<G: AffineCurve>(
+    bases: &[G],
+    params: Vec<Vec<<G::ScalarField as PrimeField>::BigInteger>>,
+) -> Result<Vec<G::Projective>, GPUError> {
+    let mut results: Vec<G::Projective> = Vec::new();
+
+    if TypeId::of::<G>() != TypeId::of::<G1Affine>() {
+        unimplemented!("trying to use cuda for unsupported curve");
+    }
+
+    let pre_check = |mut bases: &[G], mut scalars: &[<G::ScalarField as PrimeField>::BigInteger]| -> G::Projective {
+        match bases.len() < scalars.len() {
+            true => scalars = &scalars[..bases.len()],
+            false => bases = &bases[..scalars.len()],
+        }
+
+        let mut acc = G::Projective::zero();
+
+        for (base, scalar) in bases.iter().zip(scalars.iter()) {
+            acc += &base.mul_bits(BitIteratorBE::new(*scalar))
+        }
+        return acc;
+    };
+
+    let mut idx = 0;
+    let mut receivers = Vec::new();
+    for scalars in params {
+        if scalars.len() < 4 {
+            results.push(pre_check(bases, &scalars));
+        } else {
+            if idx >= CUDA_DISPATCHS.len() {
+                idx = 0;
+            }
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            // store receivers
+            receivers.push(receiver);
+
+            CUDA_DISPATCHS[idx]
+                .send(CudaRequest {
+                    bases: unsafe { std::mem::transmute(bases.to_vec()) },
+                    scalars: unsafe { std::mem::transmute(scalars) },
+                    response: sender,
+                })
+                .map_err(|_| GPUError::DeviceNotFound)?;
+            idx += 1;
+        }
+    }
+
+    for receiver in receivers {
+        match receiver.recv() {
+            Ok(x) => unsafe {
+                let r: Result<G::Projective, GPUError> = std::mem::transmute_copy(&x);
+                match r {
+                    Ok(t) => {
+                        //eprintln!("adding process 2");
+                        results.push(t);
+                    }
+                    Err(e) => {
+                        eprintln!("msm cuda 2 error: {}", e);
+                    }
+                }
+            },
+            Err(_) => {} //Err(GPUError::DeviceNotFound),
+        }
+    }
+
+    eprintln!("results len: {}", results.len());
+    Ok(results)
 }
 
 #[cfg(test)]

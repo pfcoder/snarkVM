@@ -39,6 +39,8 @@ use snarkvm_fields::{PrimeField, Zero};
 
 use std::sync::Arc;
 
+use rand::{rngs::OsRng, CryptoRng, Rng};
+
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -156,6 +158,90 @@ impl<N: Network> CoinbasePuzzle<N> {
         debug_assert!(KZG10::check(&pk.verifying_key, &commitment, point, product_eval_at_point, &proof)?);
 
         Ok(ProverSolution::new(partial_solution, proof))
+    }
+
+    pub fn batch_prove(
+        &self,
+        epoch_challenge: &EpochChallenge<N>,
+        address: Address<N>,
+        minimum_proof_target: Option<u64>,
+        batch_num: u8,
+    ) -> Result<ProverSolution<N>> {
+        // Retrieve the coinbase proving key.
+        let pk = match self {
+            Self::Prover(coinbase_proving_key) => coinbase_proving_key,
+            Self::Verifier(_) => bail!("Cannot prove the coinbase puzzle with a verifier"),
+        };
+
+        let mut evls = Vec::new();
+        let mut nonces = Vec::new();
+        let mut polynomials = Vec::new();
+        for _count in 0..batch_num {
+            let nonce = (&mut OsRng).gen();
+            nonces.push(nonce);
+            let polynomial = Self::prover_polynomial(epoch_challenge, address, nonce)?;
+            polynomials.push(polynomial.clone());
+
+            let product_evaluations = {
+                let polynomial_evaluations =
+                    pk.product_domain.in_order_fft_with_pc(&polynomial, &pk.fft_precomputation);
+                let product_evaluations = pk.product_domain.mul_polynomials_in_evaluation_domain(
+                    &polynomial_evaluations,
+                    &epoch_challenge.epoch_polynomial_evaluations().evaluations,
+                );
+                product_evaluations
+            };
+
+            evls.push(product_evaluations);
+        }
+
+        //let (commitment, _rand) =
+        let results = KZG10::batch_commit_lagrange(&pk.lagrange_basis(), &evls, None, &Default::default(), None)?;
+        //let mut sols = Vec::new();
+
+        let valid_proof;
+
+        for (pos, (commitment, _r)) in results.iter().enumerate() {
+            let partial_solution = PartialSolution::new(address, nonces[pos], *commitment);
+
+            // Check that the minimum target is met.
+            if let Some(minimum_target) = minimum_proof_target {
+                let proof_target = partial_solution.to_target()?;
+                /*ensure!(
+                    proof_target >= minimum_target,
+                    "Prover solution was below the necessary proof target ({proof_target} < {minimum_target})"
+                );*/
+                eprintln!("-----target: {} {}", proof_target, minimum_target);
+                if proof_target < minimum_target {
+                    continue;
+                }
+            }
+
+            let point = hash_commitment(&commitment)?;
+            let product_eval_at_point =
+                polynomials[pos].evaluate(point) * epoch_challenge.epoch_polynomial().evaluate(point);
+
+            let proof = KZG10::open_lagrange(
+                &pk.lagrange_basis(),
+                pk.product_domain_elements(),
+                &evls[pos],
+                point,
+                product_eval_at_point,
+            )?;
+            ensure!(!proof.is_hiding(), "The prover solution must contain a non-hiding proof");
+
+            debug_assert!(KZG10::check(&pk.verifying_key, &commitment, point, product_eval_at_point, &proof)?);
+
+            valid_proof = ProverSolution::new(partial_solution, proof);
+            return Ok(valid_proof);
+
+            //sols.push(ProverSolution::new(partial_solution, proof))
+        }
+
+        //Ok(sols)
+        //Ok(valid_proof)
+
+        Err(anyhow!("invalid proof"))
     }
 
     /// Returns a coinbase solution for the given epoch challenge and prover solutions.
